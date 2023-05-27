@@ -1,0 +1,1086 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include "diag/Trace.h"
+#include "stm32f4xx_hal.h"
+
+
+
+#define CLOCK_HOUR_FORMAT_12    (0)       // Display the time with AM/PM format
+#define CLOCK_HOUR_FORMAT_24    (1)       // Display the time with 24 Hour format
+
+#define TRUE	( 1 == 1 )
+#define FALSE	( 1 == 0 )
+
+
+// Disable specific warnings
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-parameter"
+#pragma GCC diagnostic ignored "-Wmissing-declarations"
+#pragma GCC diagnostic ignored "-Wreturn-type"
+
+// define each segment on 7 segment LED display
+#define A GPIO_PIN_2
+#define B GPIO_PIN_4
+#define C GPIO_PIN_5
+#define D GPIO_PIN_6
+#define E GPIO_PIN_7
+#define F GPIO_PIN_8
+#define G GPIO_PIN_9
+
+// enable real time clock support
+#define USE_RTC
+
+// declare all the functions
+void
+	Display7Segment( void ),
+	SetTime( void ),
+	SetAlarm( void ),
+	Snooze( void ),
+	ProcessButtons( void ),
+	GetCurrentTime( void ),
+	SystemClock_Config( void ),
+   RTC_Alarm_IRQHandler(void);
+
+// check button function
+uint16_t
+	CheckButtons( void );
+
+
+//
+// Global variables
+//
+#ifdef USE_RTC
+
+RTC_InitTypeDef
+	ClockInit;				// Structure used to initialize the real time clock
+
+RTC_HandleTypeDef
+	RealTimeClock;			// Structure for the real time clock subsystem
+
+RTC_TimeTypeDef
+	ClockTime;				// Structure to hold/store the current time
+
+RTC_DateTypeDef
+	ClockDate;				// Structure to hold the current date
+
+RTC_AlarmTypeDef
+	AlarmTime;				// Structure to hold/store the current alarm time
+
+volatile uint32_t
+	ClockAlarm;
+
+#endif
+
+
+
+TIM_HandleTypeDef
+	DisplayTimer;			// Structure for the LED display timer subsystem
+
+
+
+volatile int
+	Alarm = FALSE,			// Flag indicating alarm
+	DebounceCount = 0;		// Buttons debounce count
+
+volatile uint16_t
+	ButtonsPushed;			// Bit field containing the bits of which buttons have been pushed
+
+volatile int
+	BcdTime[4],				// Array to hold the hours and minutes in BCD format
+	DisplayedDigit = 0,		// Current digit being displayed on the LED display
+
+							// Current format for the displayed time ( IE 12 or 24 hour format )
+	ClockHourFormat = CLOCK_HOUR_FORMAT_24, // displaying 24 hour format
+	AlarmPmFlag = 0,
+	TimePmFlag = 0;
+
+void RealTimeClockInit( void )
+{
+	RCC_OscInitTypeDef
+		RCC_OscInitStruct;
+
+	RCC_PeriphCLKInitTypeDef
+		PeriphClkInitStruct;
+
+
+// Configure LSI as RTC clock source
+	RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_LSI;
+	RCC_OscInitStruct.PLL.PLLState = RCC_PLL_NONE;
+	RCC_OscInitStruct.LSIState = RCC_LSI_ON;
+
+	if( HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK )
+	{
+		trace_printf( "HAL_RCC_OscConfig failed\r\n");
+		while( TRUE );
+	}
+
+
+// Assign the LSI clock to the RTC
+	PeriphClkInitStruct.RTCClockSelection = RCC_RTCCLKSOURCE_LSI;
+	PeriphClkInitStruct.PeriphClockSelection = RCC_PERIPHCLK_RTC;
+	if(HAL_RCCEx_PeriphCLKConfig(&PeriphClkInitStruct) != HAL_OK)
+	{
+		trace_printf( "HAL_RCCEx_PeriphCLKConfig failed\r\n");
+		while( TRUE );
+	}
+
+
+// Enable the RTC
+	__HAL_RCC_RTC_ENABLE();
+
+
+// Configure the RTC format and clock divisor
+	RealTimeClock.Instance = RTC;
+	RealTimeClock.Init.HourFormat = RTC_HOURFORMAT_24;
+
+	RealTimeClock.Init.AsynchPrediv = 127;
+	RealTimeClock.Init.SynchPrediv = 0xFF;
+	RealTimeClock.Init.OutPut = RTC_OUTPUT_DISABLE;
+	RealTimeClock.Init.OutPutPolarity = RTC_OUTPUT_POLARITY_HIGH;
+	RealTimeClock.Init.OutPutType = RTC_OUTPUT_TYPE_OPENDRAIN;
+	HAL_RTC_Init(&RealTimeClock );
+
+
+// Disable the write protection for RTC registers
+	__HAL_RTC_WRITEPROTECTION_DISABLE( &RealTimeClock );
+
+// Disable the Alarm A interrupt
+	__HAL_RTC_ALARMA_DISABLE( &RealTimeClock );
+
+// Clear flag alarm A
+	__HAL_RTC_ALARM_CLEAR_FLAG(&RealTimeClock, RTC_FLAG_ALRAF);
+}
+
+
+void ConfigureDisplay( void )
+{
+
+	HAL_Init();
+	    __HAL_RCC_GPIOE_CLK_ENABLE();
+
+	    // Initializes GPIOE as low speed outputs without pulldown resistors.
+	    GPIO_InitTypeDef GPIO_Initstructure;
+	    // pin number 2, 4, 5, 6, 7, 8, 9 are the segment A, B, C, D, E, F, G respectively
+	    // pin number 10, 11, 12, 13 ,14 are the digit selected digit 1, 2, 3, 4, 5 respectively
+	    // pin number 15 is the "ALARM" LED display
+	    GPIO_Initstructure.Pin=GPIO_PIN_2|GPIO_PIN_4|GPIO_PIN_5|GPIO_PIN_6|GPIO_PIN_7|GPIO_PIN_8|GPIO_PIN_9|GPIO_PIN_10|GPIO_PIN_11|GPIO_PIN_12|GPIO_PIN_13|GPIO_PIN_14|GPIO_PIN_15;
+	    GPIO_Initstructure.Mode=GPIO_MODE_OUTPUT_PP;
+	    GPIO_Initstructure.Speed=GPIO_SPEED_LOW;
+	    GPIO_Initstructure.Pull=GPIO_NOPULL;
+	    GPIO_Initstructure.Alternate = 0;
+	    HAL_GPIO_Init(GPIOE,&GPIO_Initstructure);
+
+	    // Initializes GPIOD as a fast speed input for the button
+	    __HAL_RCC_GPIOD_CLK_ENABLE();
+	    GPIO_InitTypeDef GPIO_Initstructure1;
+	    // pin number 0, 1, 2, 3, 6, are the button SET TIME, SET ALARM, HOURS, MINUTES, SNOOZE respectively
+	    GPIO_Initstructure1.Pin=GPIO_PIN_0|GPIO_PIN_1|GPIO_PIN_2|GPIO_PIN_3|GPIO_PIN_6|GPIO_PIN_7;
+	    GPIO_Initstructure1.Mode=GPIO_MODE_INPUT;
+	    GPIO_Initstructure1.Speed=GPIO_SPEED_FAST;
+	    GPIO_Initstructure1.Pull=GPIO_PULLUP;
+	    GPIO_Initstructure1.Alternate = 0;
+	    HAL_GPIO_Init(GPIOD,&GPIO_Initstructure1);
+
+	    // Initialize RCC TIM5 for the Timer
+	    __HAL_RCC_TIM5_CLK_ENABLE();
+	   	DisplayTimer.Instance = TIM5;
+	   	// to get 250 Hz, (period + 1)*(Prescaler + 1) needs to be 336000
+	   	// this is because 84000000/336000 is 250
+	   	// 399 is used for period and 839 is used for prescaler
+	    DisplayTimer.Init.Period = 399; //period & prescaler combination for 4 seconds count
+    	DisplayTimer.Init.Prescaler =839;
+    	DisplayTimer.Init.CounterMode = TIM_COUNTERMODE_UP;
+	   	DisplayTimer.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+	   	HAL_TIM_Base_Init( &DisplayTimer );
+		HAL_NVIC_SetPriority( TIM5_IRQn, 0, 0);//set priority for the interrupt. Value 0 corresponds to highest priority
+			HAL_NVIC_EnableIRQ( TIM5_IRQn );//Enable interrupt function request of Timer5
+		__HAL_TIM_ENABLE_IT( &DisplayTimer, TIM_IT_UPDATE );// Enable timer interrupt flag to be set when timer count is reached
+		__HAL_TIM_ENABLE( &DisplayTimer );//Enable timer to start
+
+		//Enable clocks for Power clock (PWR_CLK)
+		__HAL_RCC_PWR_CLK_ENABLE();
+}
+// Segon functions simplifies the syntax for switching segments.
+void segon(uint16_t pin){
+    HAL_GPIO_WritePin(GPIOE,pin,GPIO_PIN_SET);
+}
+// segoff functions simplifies the syntax for switching segments.
+void segoff(uint16_t pin){
+    HAL_GPIO_WritePin(GPIOE,pin,GPIO_PIN_RESET);
+}
+
+int main(int argc, char* argv[])
+{
+// Reset of all peripherals, Initializes the Flash interface and the System timer.
+	HAL_Init();
+
+// Configure the system clock
+	SystemClock_Config();
+	RealTimeClockInit();
+
+// Display project name with version number
+	trace_puts(
+			"*\n"
+			"*\n"
+			"* Alarm clock project for stm32f4discovery board V2.00\n"
+			"*\n"
+			"*\n"
+			);
+
+// Initialize the seven segment display pins and push buttons
+	ConfigureDisplay();
+
+// Initialize RTC for real time clock.
+// we set the time to 16:20 so that it is not 00:00
+	ClockTime.Hours = 16;
+		ClockTime.Minutes = 20;
+		ClockTime.Seconds = 00;
+		ClockTime.SubSeconds = 0;
+		ClockTime.TimeFormat = RTC_HOURFORMAT_24;
+		ClockTime.DayLightSaving = RTC_DAYLIGHTSAVING_NONE;
+		ClockTime.StoreOperation = RTC_STOREOPERATION_RESET;
+
+// Initialize the clock date for confirmation
+	ClockDate.Date = 	21;
+		ClockDate.Month = 	RTC_MONTH_JUNE;
+		ClockDate.WeekDay = RTC_WEEKDAY_WEDNESDAY;
+		ClockDate.Year =	17;
+
+// set date in RTC
+	HAL_RTC_SetDate(&RealTimeClock, &ClockDate, RTC_FORMAT_BIN);
+		HAL_RTC_SetTime(&RealTimeClock, &ClockTime, RTC_FORMAT_BIN);
+
+	HAL_NVIC_SetPriority( RTC_Alarm_IRQn, 0, 0 );
+		HAL_NVIC_EnableIRQ( RTC_Alarm_IRQn );
+
+// Initialize alarm in RTC
+	AlarmTime.Alarm = RTC_ALARM_A;
+		AlarmTime.AlarmTime.TimeFormat = RTC_HOURFORMAT_24;
+		// initializing the alarm time to 03:03
+		AlarmTime.AlarmTime.Hours = 0x03;
+		AlarmTime.AlarmTime.Minutes = 0x03;
+		AlarmTime.AlarmTime.Seconds = 0x00;
+		AlarmTime.AlarmMask = RTC_ALARMMASK_DATEWEEKDAY;
+		AlarmTime.AlarmDateWeekDay = 1;
+		HAL_RTC_SetAlarm_IT( &RealTimeClock, &AlarmTime, RTC_FORMAT_BIN );
+
+// Send a greeting to the trace device (skipped on Release).
+	trace_puts("Initialization Complete");
+
+// At this stage the system clock should have already been configured at high speed.
+
+	trace_printf("System clock: %u Hz\n", HAL_RCC_GetSysClockFreq() /* SystemCoreClock */ );
+    trace_printf( "HClk frequency %u\r\n", HAL_RCC_GetHCLKFreq());
+    trace_printf( "PClk 1 frequency %u\r\n", HAL_RCC_GetPCLK1Freq());
+    trace_printf( "PClk 2 frequency %u\r\n", HAL_RCC_GetPCLK2Freq());
+
+	Alarm = FALSE;
+
+// Start the display timer (TIM5)
+	while ( TRUE )
+	{
+
+// Wait for an interrupt to occur
+
+		// if alarm is true turn on the alarm led display
+		if(Alarm ==TRUE){
+			segon(GPIO_PIN_15);
+
+		//else turn it off
+		}else{
+			segoff(GPIO_PIN_15);
+		}
+		__asm__ volatile ( "wfi" );
+
+	}
+}
+
+/*
+ *
+ *  System Clock Configuration
+ *
+ */
+
+void SystemClock_Config(void)
+{
+	//initialize system clock configuration
+	RCC_OscInitTypeDef RCC_OscInitStruct;
+	RCC_ClkInitTypeDef RCC_ClkInitStruct;
+	RCC_PeriphCLKInitTypeDef PeriphClkInitStruct;
+
+	__HAL_RCC_PWR_CLK_ENABLE();
+
+	__HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
+
+	RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+	RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+	RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+	RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+	RCC_OscInitStruct.PLL.PLLM = 4;
+	RCC_OscInitStruct.PLL.PLLN = 168;
+	RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
+	RCC_OscInitStruct.PLL.PLLQ = 7;
+	HAL_RCC_OscConfig(&RCC_OscInitStruct);
+
+	RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+			|RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+	RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+	RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+	RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV4;
+	RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV2;
+	HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_5);
+
+	PeriphClkInitStruct.PeriphClockSelection = RCC_PERIPHCLK_I2S;
+	PeriphClkInitStruct.PLLI2S.PLLI2SN = 192;
+	PeriphClkInitStruct.PLLI2S.PLLI2SR = 2;
+	HAL_RCCEx_PeriphCLKConfig(&PeriphClkInitStruct);
+
+	HAL_SYSTICK_Config(HAL_RCC_GetHCLKFreq()/1000);
+
+	HAL_SYSTICK_CLKSourceConfig(SYSTICK_CLKSOURCE_HCLK);
+
+	/* SysTick_IRQn interrupt configuration */
+	HAL_NVIC_SetPriority(SysTick_IRQn, 0, 0);
+}
+
+
+/*
+ * Function: TIM5_IRQHandler
+ *
+ * Description:
+ *
+ * 		Timer interrupt handler that is called at a rate of 250Hz.
+ *
+ * functionality:
+ * 		Poll the time and displays it on the 7 segment display
+ * 		Checks for button presses and handle any bounce conditions
+ * 		Do the appropriate operation based on the button pressed
+ *
+ */
+void TIM5_IRQHandler(void)
+{
+
+// Validate the correct interrupt has occurred
+	if( __HAL_TIM_GET_FLAG( &DisplayTimer, TIM_IT_UPDATE ) != RESET )
+	{
+
+		// call function GetCurrentTime();
+		GetCurrentTime();
+
+// if button of set alarm is pressed, change alarm to FALSE (turn off the alarm)
+//and get alarm time and put it on BcdTime
+if(HAL_GPIO_ReadPin(GPIOD,GPIO_PIN_1)==0){
+	Alarm=FALSE;
+	BcdTime[0]= (AlarmTime.AlarmTime.Hours-(AlarmTime.AlarmTime.Hours%10))/10;
+	BcdTime[1]=AlarmTime.AlarmTime.Hours%10;
+		BcdTime[2]=(AlarmTime.AlarmTime.Minutes-(AlarmTime.AlarmTime.Minutes%10))/10;
+		BcdTime[3]=AlarmTime.AlarmTime.Minutes%10;
+}
+
+// call function Display7Segment();
+	Display7Segment();
+
+// Process any button events
+		if ( TRUE == CheckButtons())
+		{
+			// Debug code
+			ProcessButtons();
+			SetTime();
+		    SetAlarm();
+		    Snooze();
+		}
+
+// clear the timer interrupt flag
+		__HAL_TIM_CLEAR_FLAG( &DisplayTimer, TIM_IT_UPDATE );
+    }
+}
+
+
+/*
+ * Function: RTC_Alarm_IRQHandler
+ *
+ * Description:
+ *
+ * When alarm occurs, clear all the interrupt bits and flags then start playing music.
+ *
+ */
+
+#ifdef USE_RTC
+
+void RTC_Alarm_IRQHandler(void)
+{
+
+// Verify that this is a real time clock interrupt
+	if( __HAL_RTC_ALARM_GET_IT( &RealTimeClock, RTC_IT_ALRA ) != RESET )
+	{
+
+// Clear the alarm flag and the external interrupt flag
+    	__HAL_RTC_ALARM_CLEAR_FLAG( &RealTimeClock, RTC_FLAG_ALRAF );
+    	__HAL_RTC_EXTI_CLEAR_FLAG( RTC_EXTI_LINE_ALARM_EVENT );
+
+// turn on the alarm led display
+    	Alarm = TRUE;
+
+	}
+}
+
+#endif
+
+/*
+ * Function: Display7Segment
+ *
+ * Description:
+ *
+ * Displays the current time, alarm time or time format
+ *
+ */
+
+void Display7Segment(void)
+{
+
+// clear digit selection bits
+segoff(GPIO_PIN_10);
+segoff(GPIO_PIN_11);
+segoff(GPIO_PIN_12);
+segoff(GPIO_PIN_13);
+segoff(GPIO_PIN_14);
+
+// clear segment selection bits
+segoff(A);
+segoff(B);
+segoff(C);
+segoff(D);
+segoff(E);
+segoff(F);
+segoff(G);
+
+// Select current digit
+// it will set the LED to display number depends on what digit and Bcd time
+
+//if digit 1 is selected
+if (DisplayedDigit ==0){
+
+	// select digit 1 of GPIO
+	segon(GPIO_PIN_10);
+
+	// switch the first array of BcdTime
+	switch (BcdTime[0]){
+
+	// if first array is 0
+	case 0:
+
+		// the segon and segoff of the segment will create number 0
+	   		 segon(A);
+	   		 segon(B);
+	   		 segon(C);
+	   		 segon(D);
+	   		 segon(E);
+	   		 segon(F);
+	   		 segoff(G);
+	   		 break;
+
+	// if first array is 1
+	case 1:
+
+		// the segon and segoff of the segment will create number 1
+		// this will continue until number 9
+	   		 segoff(A);
+	   		 segon(B);
+	   		 segon(C);
+	   		 segoff(D);
+	   		 segoff(E);
+	   		 segoff(F);
+	   		 segoff(G);
+	   		 break;
+ 	 case 2:
+	   		 segon(A);
+	   		 segon(B);
+	   		 segoff(C);
+	   		 segon(D);
+	   		 segon(E);
+	   		 segoff(F);
+	   		 segon(G);
+	   		 break;
+   	 case 3:
+	   		 segon(A);
+	   		 segon(B);
+	   		 segon(C);
+	   		 segon(D);
+	   		 segoff(E);
+	   		 segoff(F);
+	   		 segon(G);
+	   		 break;
+   	 case 4:
+	   		 segoff(A);
+	   		 segon(B);
+	   		 segon(C);
+	   		 segoff(D);
+	   		 segoff(E);
+	   		 segon(F);
+	   		 segon(G);
+	   		 break;
+   	 case 5:
+	   		 segon(A);
+	   		 segoff(B);
+	   		 segon(C);
+	   		 segon(D);
+	   		 segoff(E);
+	   		 segon(F);
+	   		 segon(G);
+	   		 break;
+   	 case 6:
+	   		 segon(A);
+	   		 segoff(B);
+	   		 segon(C);
+	   		 segon(D);
+	   		 segon(E);
+	   		 segon(F);
+	   		 segon(G);
+	   		 break;
+  	 case 7:
+	   		 segon(A);
+	   		 segon(B);
+	   		 segon(C);
+	   		 segoff(D);
+	   		 segoff(E);
+	   		 segoff(F);
+	   		 segoff(G);
+	   		 break;
+   	 case 8:
+	   		 segon(A);
+	   		 segon(B);
+	   		 segon(C);
+	   		 segon(D);
+	   		 segon(E);
+	   		 segon(F);
+	   		 segon(G);
+	   		 break;
+   	 case 9:
+	   		 segon(A);
+	   		 segon(B);
+	   		 segon(C);
+	   		 segoff(D);
+	   		 segoff(E);
+	   		 segon(F);
+	   		 segon(G);
+	   		 break;
+	}
+
+//if digit 2 is selected
+}else if (DisplayedDigit==1){
+
+	// this will repeat the same process of digit 1 but the 2nd digit GPIO will be selected
+	// and the second array of BcdTime will be selected
+	segon(GPIO_PIN_11);
+	switch (BcdTime[1]){
+		case 0:
+		   		 segon(A);
+		   		 segon(B);
+		   		 segon(C);
+		   		 segon(D);
+		   		 segon(E);
+		   		 segon(F);
+		   		 segoff(G);
+		   		 break;
+		case 1:
+		   		 segoff(A);
+		   		 segon(B);
+		   		 segon(C);
+		   		 segoff(D);
+		   		 segoff(E);
+		   		 segoff(F);
+		   		 segoff(G);
+		   		 break;
+		   	 case 2:
+		   		 segon(A);
+		   		 segon(B);
+		   		 segoff(C);
+		   		 segon(D);
+		   		 segon(E);
+		   		 segoff(F);
+		   		 segon(G);
+		   		 break;
+		   	 case 3:
+		   		 segon(A);
+		   		 segon(B);
+		   		 segon(C);
+		   		 segon(D);
+		   		 segoff(E);
+		   		 segoff(F);
+		   		 segon(G);
+		   		 break;
+		   	 case 4:
+		   		 segoff(A);
+		   		 segon(B);
+		   		 segon(C);
+		   		 segoff(D);
+		   		 segoff(E);
+		   		 segon(F);
+		   		 segon(G);
+		   		 break;
+		   	 case 5:
+		   		 segon(A);
+		   		 segoff(B);
+		   		 segon(C);
+		   		 segon(D);
+		   		 segoff(E);
+		   		 segon(F);
+		   		 segon(G);
+		   		 break;
+		   	 case 6:
+		   		 segon(A);
+		   		 segoff(B);
+		   		 segon(C);
+		   		 segon(D);
+		   		 segon(E);
+		   		 segon(F);
+		   		 segon(G);
+		   		 break;
+		   	 case 7:
+		   		 segon(A);
+		   		 segon(B);
+		   		 segon(C);
+		   		 segoff(D);
+		   		 segoff(E);
+		   		 segoff(F);
+		   		 segoff(G);
+		   		 break;
+		   	 case 8:
+		   		 segon(A);
+		   		 segon(B);
+		   		 segon(C);
+		   		 segon(D);
+		   		 segon(E);
+		   		 segon(F);
+		   		 segon(G);
+		   		 break;
+		   	 case 9:
+		   		 segon(A);
+		   		 segon(B);
+		   		 segon(C);
+		   		 segoff(D);
+		   		 segoff(E);
+		   		 segon(F);
+		   		 segon(G);
+		   		 break;
+		}
+
+// if Displayed digit is 2 is referring to the colon of the time **:** which is the 3rd digit
+}else if (DisplayedDigit==2){
+
+	// select GPIOE pin 12 for the colon
+		segon(GPIO_PIN_12);
+
+	// turn on segment A and B to turn on the colon
+		 segon(A);
+		 segon(B);
+
+// repeat the same process like the 1st digit and 2nd digit for 4th digit
+}else if (DisplayedDigit ==3){
+	segon(GPIO_PIN_13);
+	switch (BcdTime[2]){
+		case 0:
+		   		 segon(A);
+		   		 segon(B);
+		   		 segon(C);
+		   		 segon(D);
+		   		 segon(E);
+		   		 segon(F);
+		   		 segoff(G);
+		   		 break;
+		case 1:
+		   		 segoff(A);
+		   		 segon(B);
+		   		 segon(C);
+		   		 segoff(D);
+		   		 segoff(E);
+		   		 segoff(F);
+		   		 segoff(G);
+		   		 break;
+		   	 case 2:
+		   		 segon(A);
+		   		 segon(B);
+		   		 segoff(C);
+		   		 segon(D);
+		   		 segon(E);
+		   		 segoff(F);
+		   		 segon(G);
+		   		 break;
+		   	 case 3:
+		   		 segon(A);
+		   		 segon(B);
+		   		 segon(C);
+		   		 segon(D);
+		   		 segoff(E);
+		   		 segoff(F);
+		   		 segon(G);
+		   		 break;
+		   	 case 4:
+		   		 segoff(A);
+		   		 segon(B);
+		   		 segon(C);
+		   		 segoff(D);
+		   		 segoff(E);
+		   		 segon(F);
+		   		 segon(G);
+		   		 break;
+		   	 case 5:
+		   		 segon(A);
+		   		 segoff(B);
+		   		 segon(C);
+		   		 segon(D);
+		   		 segoff(E);
+		   		 segon(F);
+		   		 segon(G);
+		   		 break;
+		   	 case 6:
+		   		 segon(A);
+		   		 segoff(B);
+		   		 segon(C);
+		   		 segon(D);
+		   		 segon(E);
+		   		 segon(F);
+		   		 segon(G);
+		   		 break;
+		   	 case 7:
+		   		 segon(A);
+		   		 segon(B);
+		   		 segon(C);
+		   		 segoff(D);
+		   		 segoff(E);
+		   		 segoff(F);
+		   		 segoff(G);
+		   		 break;
+		   	 case 8:
+		   		 segon(A);
+		   		 segon(B);
+		   		 segon(C);
+		   		 segon(D);
+		   		 segon(E);
+		   		 segon(F);
+		   		 segon(G);
+		   		 break;
+		   	 case 9:
+		   		 segon(A);
+		   		 segon(B);
+		   		 segon(C);
+		   		 segoff(D);
+		   		 segoff(E);
+		   		 segon(F);
+		   		 segon(G);
+		   		 break;
+	}
+
+// repeat the same process like the 1st digit and 2nd digit for 5th digit
+}else if (DisplayedDigit==4){
+	segon(GPIO_PIN_14);
+	switch (BcdTime[3]){
+		case 0:
+		   		 segon(A);
+		   		 segon(B);
+		   		 segon(C);
+		   		 segon(D);
+		   		 segon(E);
+		   		 segon(F);
+		   		 segoff(G);
+		   		 break;
+		case 1:
+		   		 segoff(A);
+		   		 segon(B);
+		   		 segon(C);
+		   		 segoff(D);
+		   		 segoff(E);
+		   		 segoff(F);
+		   		 segoff(G);
+		   		 break;
+		   	 case 2:
+		   		 segon(A);
+		   		 segon(B);
+		   		 segoff(C);
+		   		 segon(D);
+		   		 segon(E);
+		   		 segoff(F);
+		   		 segon(G);
+		   		 break;
+		   	 case 3:
+		   		 segon(A);
+		   		 segon(B);
+		   		 segon(C);
+		   		 segon(D);
+		   		 segoff(E);
+		   		 segoff(F);
+		   		 segon(G);
+		   		 break;
+		   	 case 4:
+		   		 segoff(A);
+		   		 segon(B);
+		   		 segon(C);
+		   		 segoff(D);
+		   		 segoff(E);
+		   		 segon(F);
+		   		 segon(G);
+		   		 break;
+		   	 case 5:
+		   		 segon(A);
+		   		 segoff(B);
+		   		 segon(C);
+		   		 segon(D);
+		   		 segoff(E);
+		   		 segon(F);
+		   		 segon(G);
+		   		 break;
+		   	 case 6:
+		   		 segon(A);
+		   		 segoff(B);
+		   		 segon(C);
+		   		 segon(D);
+		   		 segon(E);
+		   		 segon(F);
+		   		 segon(G);
+		   		 break;
+		   	 case 7:
+		   		 segon(A);
+		   		 segon(B);
+		   		 segon(C);
+		   		 segoff(D);
+		   		 segoff(E);
+		   		 segoff(F);
+		   		 segoff(G);
+		   		 break;
+		   	 case 8:
+		   		 segon(A);
+		   		 segon(B);
+		   		 segon(C);
+		   		 segon(D);
+		   		 segon(E);
+		   		 segon(F);
+		   		 segon(G);
+		   		 break;
+		   	 case 9:
+		   		 segon(A);
+		   		 segon(B);
+		   		 segon(C);
+		   		 segoff(D);
+		   		 segoff(E);
+		   		 segon(F);
+		   		 segon(G);
+		   		 break;
+	}
+}
+
+// Advance to the next digit to be display on next interrupt
+DisplayedDigit=DisplayedDigit +1 ;
+	if(DisplayedDigit ==5){
+		DisplayedDigit=0;
+	}
+}
+
+
+/*
+ * Function: SetTime
+ *
+ * Description:
+ *
+ * Advance either the time hours or minutes field. Validate the new time and then update the clock
+ *
+ */
+
+void SetTime(void)
+{
+	// if the SET TIME button is pressed
+	if(HAL_GPIO_ReadPin(GPIOD,GPIO_PIN_0)==0){
+
+		// if the HOURS button pressed while the SET TIME pressed
+		if(HAL_GPIO_ReadPin(GPIOD,GPIO_PIN_2)==0 ){
+
+			//Get both time and date of RTC
+			HAL_RTC_GetDate(&RealTimeClock, &ClockDate, RTC_FORMAT_BIN);
+			HAL_RTC_GetTime(&RealTimeClock, &ClockTime, RTC_FORMAT_BIN);
+
+			// if hours is 23 make it 00
+			if (ClockTime.Hours==23){
+				ClockTime.Hours =00;
+
+			// else plus 1 to the hours
+			}else{
+			ClockTime.Hours = ClockTime.Hours+1;
+
+			}
+
+			// set the date and time again to the RTC
+				HAL_RTC_SetDate(&RealTimeClock, &ClockDate, RTC_FORMAT_BIN);
+				HAL_RTC_SetTime(&RealTimeClock, &ClockTime, RTC_FORMAT_BIN);
+		}
+
+		//but if the MINUTES button is pressed
+		if( HAL_GPIO_ReadPin(GPIOD,GPIO_PIN_3)==0 ){
+
+			//Get both time and date of RTC
+			HAL_RTC_GetDate(&RealTimeClock, &ClockDate, RTC_FORMAT_BIN);
+			HAL_RTC_GetTime(&RealTimeClock, &ClockTime, RTC_FORMAT_BIN);
+
+			// if minutes is 59 make it 00
+			if(ClockTime.Minutes==59){
+				ClockTime.Minutes=00;
+
+			// else plus 1 to the minutes
+			}else{
+				ClockTime.Minutes=ClockTime.Minutes+1;
+			}
+
+			// set the date and time to the RTC
+			HAL_RTC_SetDate(&RealTimeClock, &ClockDate, RTC_FORMAT_BIN);
+			HAL_RTC_SetTime(&RealTimeClock, &ClockTime, RTC_FORMAT_BIN);
+		}
+
+	}
+}
+
+/*
+ * Function: SetAlarm
+ *
+ * Description:
+ *
+ * Advance either the alarm hours or minutes field. Validate the new alarm time and then set the alarm
+ *
+ */
+
+void SetAlarm(void)
+{
+
+// if the SET ALARM button is pressed
+  if(HAL_GPIO_ReadPin(GPIOD,GPIO_PIN_1)==0){
+
+	  // if the HOURS button is pressed
+	  if(HAL_GPIO_ReadPin(GPIOD,GPIO_PIN_2)==0){
+
+		  // if the hours of alarm time is 23 then make it to 00
+		  if (AlarmTime.AlarmTime.Hours==23){
+			  AlarmTime.AlarmTime.Hours =00;
+
+		//else plus 1 to the alarm time
+		  }else{
+			  AlarmTime.AlarmTime.Hours = AlarmTime.AlarmTime.Hours+1;
+		}
+
+		  // set the alarm time to the RTC
+		  HAL_RTC_SetAlarm_IT( &RealTimeClock, &AlarmTime, RTC_FORMAT_BIN);
+
+	  }
+
+	// if the MINUTES button is pressed
+	if( HAL_GPIO_ReadPin(GPIOD,GPIO_PIN_3)==0 ){
+
+		// if the minutes is 59 then make it to 00
+			if( AlarmTime.AlarmTime.Minutes==59){
+				 AlarmTime.AlarmTime.Minutes=00;
+
+		// else plus 1 to the alarm minutes
+			}else{
+				 AlarmTime.AlarmTime.Minutes= AlarmTime.AlarmTime.Minutes+1;
+			}
+
+		// set the alarm time to the RTC
+		 HAL_RTC_SetAlarm_IT( &RealTimeClock, &AlarmTime, RTC_FORMAT_BIN);
+	}
+  }
+}
+
+
+
+
+/*
+ * Function: Snooze
+ *
+ * Description:
+ *
+ * Add 10 Minutes to the current time and validate. Update the alarm and enable.
+ *
+ */
+
+void Snooze(void)
+{
+	// if the SNOOZE button is pressed
+	if(HAL_GPIO_ReadPin(GPIOD,GPIO_PIN_6)==0&&Alarm==TRUE){
+
+		// turn of the ALARM LED display
+		Alarm =FALSE;
+
+		// add alarm minutes to the desired alarm time
+		// in this case, we snooze it for 10 minutes
+		 AlarmTime.AlarmTime.Minutes= AlarmTime.AlarmTime.Minutes+10;
+
+		 // set alarm time to the RTC
+		 HAL_RTC_SetAlarm_IT( &RealTimeClock, &AlarmTime, RTC_FORMAT_BIN);
+	}
+}
+
+
+/*
+ * Function: GetCurrentTime
+ *
+ * Description:
+ *
+ * Return either the alarm time or current time in binary coded decimal format store in the array BcdTime.
+ *
+ */
+
+void GetCurrentTime(void)
+{
+	// get time and date of RTC
+	HAL_RTC_GetDate(&RealTimeClock, &ClockDate, RTC_FORMAT_BIN);
+	HAL_RTC_GetTime(&RealTimeClock, &ClockTime, RTC_FORMAT_BIN);
+
+	// put the left digit for hours to BcdTime array number 1
+	BcdTime[0]= (ClockTime.Hours-(ClockTime.Hours%10))/10;
+
+	//put the right digit for hours to BcdTime array number 2
+	BcdTime[1]=ClockTime.Hours%10;
+
+	// put the left digit for minutes to BcdTime array number 3
+	BcdTime[2]=(ClockTime.Minutes-(ClockTime.Minutes%10))/10;
+
+	// put the right digit for minutes to BcdTime array number 4
+	BcdTime[3]=ClockTime.Minutes%10;
+}
+
+
+/*
+ * Function: CheckButtons
+ *
+ * Description:
+ *
+ * Check the current state of all the buttons and apply debounce algorithm. Return TRUE with the ButtonPushed
+ * variable set indicating the button or buttons pushed if button press is detected.
+ *
+ */
+
+uint16_t CheckButtons( void )
+{
+	// if any of the 5 button is pressed
+	if(HAL_GPIO_ReadPin(GPIOD, GPIO_PIN_0)==0||HAL_GPIO_ReadPin(GPIOD, GPIO_PIN_1)==0||HAL_GPIO_ReadPin(GPIOD, GPIO_PIN_2)==0||HAL_GPIO_ReadPin(GPIOD, GPIO_PIN_3)==0||HAL_GPIO_ReadPin(GPIOD, GPIO_PIN_6)==0){
+
+		// add the DebounceCount by 1
+		DebounceCount = DebounceCount + 1;
+
+			// if DebounceCount is equal to 20, make it 0 and return TRUE
+	        if (DebounceCount == 20){
+	        	DebounceCount=0;
+	            return TRUE;
+	        }
+	    }
+
+		// else if the buttons are not pushed, the ButtonPushed equal to 0x00
+		// and DebounceCount equal to 0, RETURN FALSE
+	    else {
+		ButtonsPushed = 0x00;
+	        DebounceCount = 0;
+	    }
+
+	return( FALSE );
+}
+
+
+#pragma GCC diagnostic pop
+
+
